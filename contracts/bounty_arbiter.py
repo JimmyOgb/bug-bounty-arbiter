@@ -1,6 +1,7 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 import json
+import re
 from dataclasses import dataclass
 from genlayer import *
 
@@ -25,8 +26,8 @@ class BugBountyArbiter(gl.Contract):
     Autonomous Bug Bounty Triage & Severity Arbiter (BugBountyArbiter)
 
     A decentralized smart contract primitive for GenLayer that automates vulnerability
-    report intake, AI-driven triage and severity assessment across validators, and on-chain
-    payout settlement while preserving strict state hygiene.
+    report intake, live policy-grounded multi-validator AI triage, exact severity consensus,
+    and on-chain payout settlement while preserving strict state hygiene.
     """
 
     project_owner: str
@@ -66,13 +67,16 @@ class BugBountyArbiter(gl.Contract):
         researcher: str,
         target_component: str,
         vulnerability_details: str,
+        target_evidence_url: str = "",
     ) -> int:
         """
         Submit a security vulnerability report for multi-validator AI adjudication.
 
-        Runs non-deterministic triage via gl.vm.run_nondet_unsafe with an Equivalence
-        Principle validator enforcing validity consensus, schema conformity, and standard
-        severity bounds.
+        Runs non-deterministic triage via gl.vm.run_nondet_unsafe:
+        1. Live web retrieval of the authoritative scope policy via gl.nondet.web.get.
+        2. Live web retrieval / verification of target evidence endpoint if provided.
+        3. Multi-validator comparative Equivalence Principle enforcing exact agreement on
+           validity boolean and exact severity tier to deterministically bind payout_due.
         """
         if not self.is_active:
             raise gl.vm.UserError("Bounty program is currently paused or inactive")
@@ -80,6 +84,7 @@ class BugBountyArbiter(gl.Contract):
         clean_researcher = str(researcher).strip() if researcher else ""
         clean_component = str(target_component).strip() if target_component else ""
         clean_details = str(vulnerability_details).strip() if vulnerability_details else ""
+        clean_evidence_url = str(target_evidence_url).strip() if target_evidence_url else ""
 
         if not clean_researcher:
             raise gl.vm.UserError("Researcher identity/address cannot be empty")
@@ -89,23 +94,87 @@ class BugBountyArbiter(gl.Contract):
             raise gl.vm.UserError("Vulnerability details cannot be empty")
 
         policy_url = self.scope_policy_url
+        if not policy_url:
+            raise gl.vm.UserError("Scope policy URL cannot be empty")
+
+        # Resolve evidence URL from explicit argument, target component, or details text
+        evidence_url = clean_evidence_url
+        if not evidence_url:
+            if clean_component.startswith(("http://", "https://")):
+                evidence_url = clean_component
+            else:
+                url_match = re.search(r'https?://[^\s<>"\')]+', clean_details)
+                if url_match and url_match.group(0) != policy_url:
+                    evidence_url = url_match.group(0)
+
+        if evidence_url and not (evidence_url.startswith("http://") or evidence_url.startswith("https://")):
+            evidence_url = "https://" + evidence_url
 
         def leader_fn() -> dict:
+            # 1. Live web retrieval of authoritative scope policy
+            try:
+                policy_res = gl.nondet.web.get(policy_url)
+                if policy_res.status != 200:
+                    raise gl.vm.UserError(
+                        f"Failed to fetch scope policy from {policy_url}: HTTP status {policy_res.status}"
+                    )
+                policy_body_bytes = policy_res.body or b""
+                policy_text = policy_body_bytes.decode("utf-8", errors="replace").strip()
+                if not policy_text:
+                    raise gl.vm.UserError("Scope policy content is empty")
+            except gl.vm.UserError:
+                raise
+            except Exception as e:
+                raise gl.vm.UserError(f"Failed to fetch scope policy: {e}")
+
+            # Safely truncate policy to prevent LLM context token overflow
+            policy_snippet = policy_text[:4000]
+
+            # 2. Live target endpoint / evidence retrieval to ground report in verifiable reality
+            evidence_context = ""
+            if evidence_url:
+                try:
+                    ev_res = gl.nondet.web.get(evidence_url)
+                    ev_status = ev_res.status
+                    ev_body_bytes = (ev_res.body or b"")[:1500]
+                    ev_body_sample = ev_body_bytes.decode("utf-8", errors="replace")
+                    ev_headers = {
+                        k: (v.decode("utf-8", errors="replace") if isinstance(v, bytes) else str(v))
+                        for k, v in list((ev_res.headers or {}).items())[:5]
+                    }
+                    evidence_context = (
+                        f"\n\n=== LIVE TARGET EVIDENCE VERIFICATION ===\n"
+                        f"Target Evidence URL: {evidence_url}\n"
+                        f"HTTP Response Status: {ev_status}\n"
+                        f"Response Headers Sample: {json.dumps(ev_headers)}\n"
+                        f"Response Body Sample: {ev_body_sample}\n"
+                    )
+                except Exception as e:
+                    evidence_context = (
+                        f"\n\n=== LIVE TARGET EVIDENCE VERIFICATION ===\n"
+                        f"Target Evidence URL: {evidence_url}\n"
+                        f"Verification Notice: Failed to retrieve live target evidence ({e})\n"
+                    )
+
             prompt = f"""You are an autonomous smart contract security auditor and bug bounty arbiter.
 Evaluate the following vulnerability report submitted against the specified target component.
 
-Scope Policy URL: {policy_url}
+=== AUTHORITATIVE SCOPE POLICY (from {policy_url}) ===
+{policy_snippet}
+
+=== SUBMISSION DETAILS ===
 Target Component: {clean_component}
 Submission Details:
-\"\"\"{clean_details}\"\"\"
+\"\"\"{clean_details}\"\"\"{evidence_context}
 
 Evaluation Guidelines:
-1. Assess whether the submission describes a genuine, in-scope security vulnerability affecting '{clean_component}'.
-2. "valid": Set to true if the report details a real security flaw. Set to false if it is spam, invalid, informational only, out-of-scope, or intended behavior.
-3. "severity": Standard classification tier strictly chosen from: "NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL".
+1. Assess whether the submission describes a genuine, in-scope security vulnerability affecting '{clean_component}' based strictly on the authoritative scope policy.
+2. If live target evidence is provided, verify whether the reported behavior aligns with the live endpoint responses. If evidence refutes the claim or shows intended behavior, evaluate accordingly.
+3. "valid": Set to true if the report details a real in-scope security flaw. Set to false if it is spam, invalid, informational only, out-of-scope per policy, intended behavior, or refuted by live evidence.
+4. "severity": Standard classification tier strictly chosen from: "NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL".
    - If "valid" is false, "severity" MUST strictly be "NONE".
-   - If "valid" is true, assign "LOW", "MEDIUM", "HIGH", or "CRITICAL" reflecting practical exploitability and financial/governance impact.
-4. "rationale": Provide a concise technical explanation (under 250 characters).
+   - If "valid" is true, assign "LOW", "MEDIUM", "HIGH", or "CRITICAL" reflecting practical exploitability, financial/governance impact, and scope policy definitions.
+5. "rationale": Provide a concise technical explanation (under 250 characters).
 
 Return strictly a JSON object conforming to:
 {{
@@ -167,7 +236,7 @@ Return strictly a JSON object conforming to:
             if not leader_rationale:
                 return False
 
-            # 3. Reject transactions where the leader hallucinates invalid tiers
+            # 3. Reject transactions where the leader proposes invalid tiers
             if leader_sev not in ALLOWED_SEVERITIES:
                 return False
 
@@ -177,7 +246,7 @@ Return strictly a JSON object conforming to:
             if leader_valid and leader_sev == "NONE":
                 return False
 
-            # 5. Validator independently runs evaluation
+            # 5. Validator independently runs evaluation (including independent web fetch & prompt)
             try:
                 val_payload = leader_fn()
             except Exception:
@@ -197,22 +266,11 @@ Return strictly a JSON object conforming to:
             if val_sev not in ALLOWED_SEVERITIES:
                 return False
 
-            # 8. If invalid, both must agree on NONE severity
-            if not leader_valid:
-                return leader_sev == "NONE" and val_sev == "NONE"
-
-            # 9. When valid, neither can be NONE
-            if leader_sev == "NONE" or val_sev == "NONE":
-                return False
-
-            # 10. Severity tier agreement: allow adjacent tier tolerance (diff <= 1)
-            # Rejects major divergences where leader and validator assess risk differently
-            leader_rank = SEVERITY_RANKS.get(leader_sev, -1)
-            val_rank = SEVERITY_RANKS.get(val_sev, -1)
-            if leader_rank < 1 or val_rank < 1:
-                return False
-
-            if abs(leader_rank - val_rank) > 1:
+            # 8. Strict Severity Equivalence (Exact Binding):
+            # Because severity tier directly indexes into self.payout_table (payout_due),
+            # validators MUST independently agree on the EXACT severity tier.
+            # Zero tolerance for adjacent tier drift or divergence.
+            if leader_sev != val_sev:
                 return False
 
             return True

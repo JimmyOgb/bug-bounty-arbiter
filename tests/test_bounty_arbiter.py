@@ -1,10 +1,44 @@
 import json
 import pytest
 
+DEFAULT_POLICY_URL = "https://security.example.io/policy.md"
+DEFAULT_POLICY_BODY = """# Bug Bounty Program Scope Policy
+## Authorized In-Scope Components:
+- VaultCore.sol: Core asset vault and liquidity pool contracts.
+- DexRouter.sol: Automated market maker router.
+- Bridge.sol: Cross-chain messaging relay endpoint.
+- Staking.sol: Reward staking and distribution.
+- Oracle.sol: Median price feed integration.
+- Token.sol: ERC-20 token implementation.
+
+## Out-of-Scope:
+- GovernanceToken.sol: Informational only, public features.
+- Denial of service attacks requiring extreme resources.
+"""
+
+
+@pytest.fixture(autouse=True)
+def default_web_mock(direct_vm):
+    """Automatically mock scope policy web fetches for all test cases."""
+    direct_vm.mock_web(
+        r".*security\.example\.io.*",
+        {"status": 200, "body": DEFAULT_POLICY_BODY},
+    )
+
+
+def mock_policy(
+    direct_vm,
+    url_pattern: str = r".*security\.example\.io.*",
+    body: str = DEFAULT_POLICY_BODY,
+    status: int = 200,
+):
+    """Helper to re-register scope policy web mock after clear_mocks()."""
+    direct_vm.mock_web(url_pattern, {"status": status, "body": body})
+
 
 def test_initialization_and_program_status(direct_vm, direct_deploy, direct_alice):
     owner = "0x" + direct_alice.hex()
-    policy_url = "https://security.example.io/bounty-policy.md"
+    policy_url = DEFAULT_POLICY_URL
 
     contract = direct_deploy("contracts/bounty_arbiter.py", owner, policy_url)
     status = contract.get_program_status()
@@ -36,7 +70,7 @@ def test_submit_report_valid_critical(direct_vm, direct_deploy, direct_alice):
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
         "0x" + direct_alice.hex(),
-        "https://security.example.io/policy.md",
+        DEFAULT_POLICY_URL,
     )
     direct_vm.sender = direct_alice
 
@@ -90,6 +124,7 @@ def test_submit_report_valid_tiers(direct_vm, direct_deploy, direct_alice):
 
     for idx, (tier, expected_payout, rationale) in enumerate(tiers, start=1):
         direct_vm.clear_mocks()
+        mock_policy(direct_vm)
         direct_vm.mock_llm(
             r".*",
             json.dumps({"valid": True, "severity": tier, "rationale": rationale}),
@@ -173,6 +208,7 @@ def test_validator_rejection_validity_disagreement(direct_vm, direct_deploy, dir
 
     # Swap mock so validator independently evaluates report as invalid
     direct_vm.clear_mocks()
+    mock_policy(direct_vm)
     direct_vm.mock_llm(
         r".*",
         json.dumps({"valid": False, "severity": "NONE", "rationale": "Design limitation, not bug"}),
@@ -267,15 +303,55 @@ def test_validator_rejection_malformed_schema(direct_vm, direct_deploy, direct_a
     assert direct_vm.run_validator(leader_result="unexpected string result") is False
 
 
-def test_validator_rejection_major_severity_divergence(direct_vm, direct_deploy, direct_alice):
+def test_validator_rejection_adjacent_severity_mismatch(direct_vm, direct_deploy, direct_alice):
     """
-    Equivalence Principle: Major severity divergence (e.g. leader CRITICAL vs validator LOW)
-    violates consensus tolerance and is rejected.
+    Strict Severity Equivalence: Any severity tier mismatch—including adjacent tiers
+    (e.g., HIGH vs MEDIUM, CRITICAL vs HIGH)—MUST cause validator_fn to return False.
     """
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
         "0x" + direct_alice.hex(),
-        "https://security.example.io/policy.md",
+        DEFAULT_POLICY_URL,
+    )
+    direct_vm.sender = direct_alice
+
+    adjacent_pairs = [
+        ("HIGH", "MEDIUM"),
+        ("CRITICAL", "HIGH"),
+        ("MEDIUM", "LOW"),
+    ]
+
+    for leader_tier, validator_tier in adjacent_pairs:
+        direct_vm.clear_mocks()
+        mock_policy(direct_vm)
+        direct_vm.mock_llm(
+            r".*",
+            json.dumps({"valid": True, "severity": leader_tier, "rationale": f"Leader saw {leader_tier}"}),
+        )
+
+        contract.submit_report("0xResearcher", "Oracle.sol", "Price feed latency manipulation")
+
+        # Validator independently evaluates same report as adjacent tier
+        direct_vm.clear_mocks()
+        mock_policy(direct_vm)
+        direct_vm.mock_llm(
+            r".*",
+            json.dumps({"valid": True, "severity": validator_tier, "rationale": f"Validator saw {validator_tier}"}),
+        )
+
+        val_passed = direct_vm.run_validator()
+        assert val_passed is False, f"Validator must reject adjacent mismatch: leader {leader_tier} vs validator {validator_tier}"
+
+
+def test_validator_rejection_major_severity_divergence(direct_vm, direct_deploy, direct_alice):
+    """
+    Equivalence Principle: Major severity divergence (e.g. leader CRITICAL vs validator LOW)
+    violates exact severity consensus and is rejected.
+    """
+    contract = direct_deploy(
+        "contracts/bounty_arbiter.py",
+        "0x" + direct_alice.hex(),
+        DEFAULT_POLICY_URL,
     )
     direct_vm.sender = direct_alice
 
@@ -286,8 +362,9 @@ def test_validator_rejection_major_severity_divergence(direct_vm, direct_deploy,
     )
     contract.submit_report("0xResearcher", "Oracle.sol", "Price manipulation")
 
-    # Validator independently evaluates same report as LOW (tier difference = 3 > 1)
+    # Validator independently evaluates same report as LOW
     direct_vm.clear_mocks()
+    mock_policy(direct_vm)
     direct_vm.mock_llm(
         r".*",
         json.dumps({"valid": True, "severity": "LOW", "rationale": "Minor edge case"}),
@@ -295,6 +372,175 @@ def test_validator_rejection_major_severity_divergence(direct_vm, direct_deploy,
 
     val_passed = direct_vm.run_validator()
     assert val_passed is False, "Validator must reject major severity tier divergences"
+
+
+def test_validator_acceptance_exact_severity_match(direct_vm, direct_deploy, direct_alice):
+    """
+    Exact Binding: When leader and validator independently agree on the exact same
+    severity tier and validity, consensus succeeds and locks the exact deterministic payout.
+    """
+    contract = direct_deploy(
+        "contracts/bounty_arbiter.py",
+        "0x" + direct_alice.hex(),
+        DEFAULT_POLICY_URL,
+    )
+    direct_vm.sender = direct_alice
+
+    expected_payouts = {
+        "LOW": 100,
+        "MEDIUM": 500,
+        "HIGH": 2000,
+        "CRITICAL": 5000,
+    }
+
+    for tier, payout in expected_payouts.items():
+        direct_vm.clear_mocks()
+        mock_policy(direct_vm)
+        direct_vm.mock_llm(
+            r".*",
+            json.dumps({"valid": True, "severity": tier, "rationale": f"Exact agreement on {tier}"}),
+        )
+
+        rep_id = contract.submit_report(f"0xResearcher_{tier}", "VaultCore.sol", f"Vulnerability {tier}")
+        assert direct_vm.run_validator() is True
+
+        rep = contract.get_report(rep_id)
+        assert rep["valid"] is True
+        assert rep["severity"] == tier
+        assert rep["payout_due"] == payout
+
+
+def test_policy_content_retrieved_and_passed_to_evaluator(direct_vm, direct_deploy, direct_alice):
+    """
+    Live Grounded Web Retrieval: Verify that the authoritative policy body fetched
+    from scope_policy_url is injected into the LLM evaluation prompt.
+    """
+    custom_policy_url = "https://security.custom.io/policy.md"
+    unique_policy_token = "UNIQUE_SCOPE_TOKEN_VAULT_CORE_RESTRICTED"
+    custom_policy_content = f"# Security Policy\n{unique_policy_token}\nIn-scope: VaultCore.sol"
+
+    contract = direct_deploy(
+        "contracts/bounty_arbiter.py",
+        "0x" + direct_alice.hex(),
+        custom_policy_url,
+    )
+    direct_vm.sender = direct_alice
+
+    direct_vm.clear_mocks()
+    direct_vm.mock_web(
+        r".*security\.custom\.io/policy\.md.*",
+        {"status": 200, "body": custom_policy_content},
+    )
+
+    # LLM mock ONLY matches if the unique token from the fetched policy is present in the prompt
+    direct_vm.mock_llm(
+        rf".*{unique_policy_token}.*",
+        json.dumps({"valid": True, "severity": "HIGH", "rationale": "Grounded by scope policy"}),
+    )
+
+    rep_id = contract.submit_report("0xAlice", "VaultCore.sol", "Issue grounded in scope policy")
+    assert rep_id == 1
+    assert direct_vm.run_validator() is True
+
+    rep = contract.get_report(1)
+    assert rep["valid"] is True
+    assert rep["severity"] == "HIGH"
+
+
+def test_live_target_evidence_retrieved_and_passed_to_evaluator(direct_vm, direct_deploy, direct_alice):
+    """
+    Live Grounded Evidence Retrieval: If a target endpoint / evidence URL is provided,
+    live web evidence is fetched and injected into the prompt.
+    """
+    contract = direct_deploy(
+        "contracts/bounty_arbiter.py",
+        "0x" + direct_alice.hex(),
+        DEFAULT_POLICY_URL,
+    )
+    direct_vm.sender = direct_alice
+
+    evidence_url = "https://api.vault.xyz/v1/health"
+    evidence_payload = '{"health": "degraded", "reentrancy_window": "open"}'
+
+    direct_vm.clear_mocks()
+    mock_policy(direct_vm)
+    direct_vm.mock_web(
+        r".*api\.vault\.xyz/v1/health.*",
+        {"status": 200, "body": evidence_payload},
+    )
+
+    # LLM mock requires evidence URL and payload to be present in prompt
+    direct_vm.mock_llm(
+        r"(?s).*LIVE TARGET EVIDENCE VERIFICATION.*api\.vault\.xyz/v1/health.*reentrancy_window.*",
+        json.dumps({"valid": True, "severity": "CRITICAL", "rationale": "Verified with live endpoint evidence"}),
+    )
+
+    rep_id = contract.submit_report(
+        "0xResearcher",
+        "VaultCore.sol",
+        "Vault reentrancy vulnerability",
+        target_evidence_url=evidence_url,
+    )
+    assert rep_id == 1
+    assert direct_vm.run_validator() is True
+
+    rep = contract.get_report(1)
+    assert rep["valid"] is True
+    assert rep["severity"] == "CRITICAL"
+
+
+def test_failed_web_fetch_reverts(direct_vm, direct_deploy, direct_alice):
+    """
+    Failed web fetch (e.g. HTTP 404 or HTTP 500) causes safe contract revert.
+    """
+    contract = direct_deploy(
+        "contracts/bounty_arbiter.py",
+        "0x" + direct_alice.hex(),
+        DEFAULT_POLICY_URL,
+    )
+    direct_vm.sender = direct_alice
+
+    # Mock HTTP 404 failure
+    direct_vm.clear_mocks()
+    mock_policy(direct_vm, status=404, body="Policy Not Found")
+
+    with direct_vm.expect_revert("Failed to fetch scope policy"):
+        contract.submit_report("0xResearcher", "VaultCore.sol", "Bug details")
+
+
+def test_empty_scope_policy_reverts(direct_vm, direct_deploy, direct_alice):
+    """
+    Empty scope policy body causes safe contract revert.
+    """
+    contract = direct_deploy(
+        "contracts/bounty_arbiter.py",
+        "0x" + direct_alice.hex(),
+        DEFAULT_POLICY_URL,
+    )
+    direct_vm.sender = direct_alice
+
+    direct_vm.clear_mocks()
+    mock_policy(direct_vm, status=200, body="   ")
+
+    with direct_vm.expect_revert("Scope policy content is empty"):
+        contract.submit_report("0xResearcher", "VaultCore.sol", "Bug details")
+
+
+def test_missing_web_mock_reverts_safely(direct_vm, direct_deploy, direct_alice):
+    """
+    If no web mock exists for scope policy, execution reverts safely.
+    """
+    contract = direct_deploy(
+        "contracts/bounty_arbiter.py",
+        "0x" + direct_alice.hex(),
+        DEFAULT_POLICY_URL,
+    )
+    direct_vm.sender = direct_alice
+
+    direct_vm.clear_mocks()
+    # No web mock registered
+    with direct_vm.expect_revert("Failed to fetch scope policy"):
+        contract.submit_report("0xResearcher", "VaultCore.sol", "Bug details")
 
 
 def test_claim_payout_flow(direct_vm, direct_deploy, direct_alice):

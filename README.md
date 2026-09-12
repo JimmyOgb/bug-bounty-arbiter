@@ -3,10 +3,10 @@
 [![GenLayer Intelligent Contract](https://img.shields.io/badge/GenLayer-Intelligent%20Contract-8A2BE2.svg)](https://genlayer.com)
 [![GenVM Runner](https://img.shields.io/badge/GenVM-py--genlayer%20v0.3.0--rc7-blue.svg)](https://github.com/genlayerlabs/genvm)
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/Tests-18%2F18%20Passing-brightgreen.svg)](tests/test_bounty_arbiter.py)
+[![Tests](https://img.shields.io/badge/Tests-25%2F25%20Passing-brightgreen.svg)](tests/test_bounty_arbiter.py)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A decentralized, autonomous Web3 security coordination primitive built for **GenLayer**. `BugBountyArbiter` automates vulnerability report intake, multi-validator AI-driven triage, severity arbitration, and on-chain payout settlement while maintaining strict state hygiene.
+A decentralized, autonomous Web3 security coordination primitive built for **GenLayer**. `BugBountyArbiter` automates vulnerability report intake, live policy-grounded multi-validator AI triage, exact severity consensus arbitration, and on-chain payout settlement while maintaining strict state hygiene.
 
 ---
 
@@ -22,10 +22,10 @@ In traditional Web2 and Web3 bug bounty programs (e.g. Immunefi, HackerOne), the
 ### How `BugBountyArbiter` Solves This
 
 `BugBountyArbiter` removes the need for centralized arbiters by embedding autonomous multi-validator AI adjudication directly into an on-chain smart contract:
-1. **Deterministic Scope Evaluation**: Vulnerability submissions are evaluated against an immutable, on-chain scope policy reference (`scope_policy_url`).
-2. **Decentralized Multi-Validator Consensus**: GenLayer validators independently assess the validity and severity of the reported issue using GenVM's native LLM capabilities (`gl.nondet.exec_prompt`).
-3. **Equivalence Principle Enforcement**: Consensus rules enforce strict agreement on vulnerability validity, reject hallucinated severity tiers, and prevent payout manipulation.
-4. **Guaranteed On-Chain Settlement**: Once consensus finalizes a valid finding, bounty payouts are locked and claimable directly via contract execution, eliminating human dispute mediation.
+1. **Live Grounded Web Retrieval**: Validators fetch the authoritative, live scope policy from `scope_policy_url` (and verify live target evidence/headers if provided) using GenVM's native web capabilities (`gl.nondet.web.get`) before evaluating reports.
+2. **Decentralized Multi-Validator Consensus**: GenLayer validators independently triage the vulnerability against the retrieved policy and target evidence using GenVM's native LLM capabilities (`gl.nondet.exec_prompt`).
+3. **Strict Severity Equivalence (Exact Binding)**: Because severity tier directly indexes into `payout_table` (`payout_due`), validators MUST independently agree on the **exact severity tier** (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`, `NONE`) and the exact `valid` boolean. Adjacent tier tolerances are eliminated to prevent payout divergence.
+4. **Guaranteed On-Chain Settlement**: Once consensus finalizes an exact valid finding, bounty payouts are locked and claimable directly via contract execution, eliminating human dispute mediation.
 
 ---
 
@@ -95,7 +95,11 @@ class Report:
 
 Because LLMs generate natural language non-deterministically, standard blockchain equality (`gl.eq_principle.strict_eq`) would fail across validators. Conversely, naive schema-only checks (which merely inspect whether the leader formatted JSON correctly) blindly trust the leader without running independent verification.
 
-`BugBountyArbiter` implements a **Comparative Equivalence Principle** using `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)`.
+`BugBountyArbiter` implements a **Comparative Equivalence Principle** using `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)` combined with **Live Grounded Web Retrieval** and **Strict Severity Equivalence**:
+
+1. **Authoritative Scope Policy Retrieval**: Inside `leader_fn`, validators use `gl.nondet.web.get(self.scope_policy_url)` to fetch the live scope policy markdown directly from the web, injecting the content into the evaluation prompt.
+2. **Live Target Evidence Verification**: If an external target endpoint or evidence URL is provided in the submission (as `target_evidence_url`, in `target_component`, or in the report text), validators execute `gl.nondet.web.get(evidence_url)` to verify headers, response status, and body samples. This grounds the evaluation in verifiable reality and prevents prompt hallucinations.
+3. **Exact Severity Binding**: Because the severity tier directly indexes into `self.payout_table` (`payout_due`), loose tolerances (such as adjacent severity allowances) are strictly rejected. If `leader_data["severity"] != my_eval["severity"]`, `validator_fn` returns `False`. Consensus is only achieved when both leader and validator independently arrive at the exact same severity tier and validity decision.
 
 ### Sequence Diagram
 
@@ -104,14 +108,22 @@ sequenceDiagram
     autonumber
     actor Researcher as Security Researcher
     participant Contract as BugBountyArbiter (GenVM)
+    participant Web as Live Web (gl.nondet.web.get)
     participant Leader as Leader Validator (LLM)
     participant Validators as Validator Network (LLM)
     actor Owner as Project Owner
 
-    Researcher->>Contract: submit_report(researcher, target_component, details)
+    Researcher->>Contract: submit_report(researcher, component, details, evidence_url?)
     activate Contract
-    Contract->>Leader: leader_fn() -> gl.nondet.exec_prompt(LLM Triage)
+    Contract->>Leader: leader_fn()
     activate Leader
+    Leader->>Web: gl.nondet.web.get(scope_policy_url)
+    Web-->>Leader: Authoritative Scope Policy Content
+    opt Evidence URL provided
+        Leader->>Web: gl.nondet.web.get(evidence_url)
+        Web-->>Leader: Live Target Evidence & HTTP Headers
+    end
+    Leader->>Leader: gl.nondet.exec_prompt(Grounded LLM Triage)
     Leader-->>Contract: Proposed Outcome: {valid, severity, rationale}
     deactivate Leader
 
@@ -120,14 +132,16 @@ sequenceDiagram
     Validators->>Validators: 1. Verify schema integrity (valid, severity, rationale)
     Validators->>Validators: 2. Verify severity in standard tiers (reject hallucinations)
     Validators->>Validators: 3. Verify semantic coherence (not valid -> NONE severity)
+    Validators->>Web: Independent gl.nondet.web.get(scope_policy_url) & evidence
+    Web-->>Validators: Authoritative Data
     Validators->>Validators: 4. Rerun evaluation independently: val_payload = leader_fn()
     Validators->>Validators: 5. Enforce strict equality on valid boolean (leader_valid == val_valid)
-    Validators->>Validators: 6. Enforce severity tier agreement (rank diff <= 1 tier tolerance)
+    Validators->>Validators: 6. Enforce EXACT severity agreement (leader_sev == val_sev)
     Validators-->>Contract: Consensus Decision (True = Approve / False = Reject)
     deactivate Validators
 
     alt Consensus Approved
-        Contract->>Contract: Increment total_submissions & map payout_due
+        Contract->>Contract: Increment total_submissions & map exact payout_due
         Contract->>Contract: Store sanitized Report in reports[report_id]
         Contract-->>Researcher: Return new report_id
     else Consensus Rejected
@@ -152,9 +166,11 @@ sequenceDiagram
 | **Payload Schema** | Dictionary with keys `"valid"`, `"severity"`, `"rationale"` | Returns `False`: Malformed JSON or corrupted return structure. |
 | **Standard Tiers** | `leader_sev in {"NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL"}` | Returns `False`: Rejects hallucinated tiers (e.g. `SUPER_CRITICAL`, `FATAL`). |
 | **Semantic Coherence** | If `not valid` ➔ `severity == "NONE"`; If `valid` ➔ `severity != "NONE"` | Returns `False`: Rejects self-contradictory proposals. |
-| **Independent Verification** | `val_payload = leader_fn()` | Returns `False`: Validator independently queries the model; cannot trust leader alone. |
+| **Live Web Policy Fetch** | `policy_res.status == 200` and non-empty policy body | Reverts transaction: Missing or failed scope policy fetch halts execution safely. |
+| **Target Evidence Fetch** | Live endpoint fetch when URL provided | Injects status, headers, and body snippet into prompt for grounded evaluation. |
+| **Independent Verification** | `val_payload = leader_fn()` | Returns `False`: Validator independently executes web retrieval and LLM prompt. |
 | **Strict Validity Equality** | `leader_valid == val_valid` | Returns `False`: **Zero tolerance for validity disputes**. Both must agree report is valid. |
-| **Severity Tier Bounding** | `abs(SEVERITY_RANKS[leader] - SEVERITY_RANKS[validator]) <= 1` | Returns `False`: Rejects major divergence (e.g. leader claims `CRITICAL` while validator assesses `LOW`). |
+| **Exact Severity Equivalence** | `leader_sev == val_sev` | Returns `False`: **Zero tolerance for severity mismatches**. Adjacent tiers (e.g. High vs Medium) rejected to bind exact payout. |
 
 ---
 
@@ -174,7 +190,7 @@ def __init__(project_owner: str, scope_policy_url: str)
 
 | Method | Type | Parameters | Returns | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `submit_report` | Write | `researcher: str`, `target_component: str`, `vulnerability_details: str` | `int` (report ID) | Ingests a vulnerability report. Triggers multi-validator LLM triage and equivalence verification. Persists sanitized outcome. |
+| `submit_report` | Write | `researcher: str`, `target_component: str`, `vulnerability_details: str`, `target_evidence_url: str = ""` | `int` (report ID) | Ingests a vulnerability report. Fetches live scope policy & target evidence via `gl.nondet.web.get`, runs multi-validator LLM triage, and enforces exact severity equivalence. Persists sanitized outcome. |
 | `claim_payout` | Write | `report_id: int` | `int` (payout amount) | Authorizes and claims payout for a verified valid report. Strictly gated against double-claims and invalid reports. |
 | `get_report` | View | `report_id: int` | `dict` | Returns on-chain metadata for a submission (`id`, `researcher`, `target_component`, `valid`, `severity`, `rationale`, `payout_due`, `claimed`). |
 | `get_program_status`| View | _None_ | `dict` | Returns program health: `project_owner`, `scope_policy_url`, `is_active`, `total_submissions`, and full `payout_table`. |
@@ -214,28 +230,35 @@ Run the 18 direct-mode and consensus mock tests with pytest:
 pytest -v tests/test_bounty_arbiter.py
 ```
 
-### Test Suite Breakdown (18/18 Passing)
+### Test Suite Breakdown (25/25 Passing)
 ```text
-tests/test_bounty_arbiter.py::test_initialization_and_program_status PASSED      [  5%]
-tests/test_bounty_arbiter.py::test_initialization_empty_owner_reverts PASSED     [ 11%]
-tests/test_bounty_arbiter.py::test_initialization_empty_policy_url_reverts PASSED [ 16%]
-tests/test_bounty_arbiter.py::test_submit_report_valid_critical PASSED           [ 22%]
-tests/test_bounty_arbiter.py::test_submit_report_valid_tiers PASSED              [ 27%]
-tests/test_bounty_arbiter.py::test_submit_report_invalid_spam PASSED             [ 33%]
-tests/test_bounty_arbiter.py::test_validator_rejection_validity_disagreement PASSED [ 38%]
-tests/test_bounty_arbiter.py::test_validator_rejection_hallucinated_severity_tier PASSED [ 44%]
-tests/test_bounty_arbiter.py::test_validator_rejection_semantic_contradiction PASSED [ 50%]
-tests/test_bounty_arbiter.py::test_validator_rejection_malformed_schema PASSED [ 55%]
-tests/test_bounty_arbiter.py::test_validator_rejection_major_severity_divergence PASSED [ 61%]
-tests/test_bounty_arbiter.py::test_claim_payout_flow PASSED                      [ 66%]
-tests/test_bounty_arbiter.py::test_claim_payout_gating_double_claim_reverts PASSED [ 72%]
-tests/test_bounty_arbiter.py::test_claim_payout_gating_invalid_report_reverts PASSED [ 77%]
-tests/test_bounty_arbiter.py::test_claim_payout_nonexistent_report_reverts PASSED [ 83%]
-tests/test_bounty_arbiter.py::test_submit_report_when_program_inactive_reverts PASSED [ 88%]
-tests/test_bounty_arbiter.py::test_submit_report_input_validation PASSED         [ 94%]
+tests/test_bounty_arbiter.py::test_initialization_and_program_status PASSED      [  4%]
+tests/test_bounty_arbiter.py::test_initialization_empty_owner_reverts PASSED     [  8%]
+tests/test_bounty_arbiter.py::test_initialization_empty_policy_url_reverts PASSED [ 12%]
+tests/test_bounty_arbiter.py::test_submit_report_valid_critical PASSED           [ 16%]
+tests/test_bounty_arbiter.py::test_submit_report_valid_tiers PASSED              [ 20%]
+tests/test_bounty_arbiter.py::test_submit_report_invalid_spam PASSED             [ 24%]
+tests/test_bounty_arbiter.py::test_validator_rejection_validity_disagreement PASSED [ 28%]
+tests/test_bounty_arbiter.py::test_validator_rejection_hallucinated_severity_tier PASSED [ 32%]
+tests/test_bounty_arbiter.py::test_validator_rejection_semantic_contradiction PASSED [ 36%]
+tests/test_bounty_arbiter.py::test_validator_rejection_malformed_schema PASSED [ 40%]
+tests/test_bounty_arbiter.py::test_validator_rejection_adjacent_severity_mismatch PASSED [ 44%]
+tests/test_bounty_arbiter.py::test_validator_rejection_major_severity_divergence PASSED [ 48%]
+tests/test_bounty_arbiter.py::test_validator_acceptance_exact_severity_match PASSED [ 52%]
+tests/test_bounty_arbiter.py::test_policy_content_retrieved_and_passed_to_evaluator PASSED [ 56%]
+tests/test_bounty_arbiter.py::test_live_target_evidence_retrieved_and_passed_to_evaluator PASSED [ 60%]
+tests/test_bounty_arbiter.py::test_failed_web_fetch_reverts PASSED               [ 64%]
+tests/test_bounty_arbiter.py::test_empty_scope_policy_reverts PASSED             [ 68%]
+tests/test_bounty_arbiter.py::test_missing_web_mock_reverts_safely PASSED        [ 72%]
+tests/test_bounty_arbiter.py::test_claim_payout_flow PASSED                      [ 76%]
+tests/test_bounty_arbiter.py::test_claim_payout_gating_double_claim_reverts PASSED [ 80%]
+tests/test_bounty_arbiter.py::test_claim_payout_gating_invalid_report_reverts PASSED [ 84%]
+tests/test_bounty_arbiter.py::test_claim_payout_nonexistent_report_reverts PASSED [ 88%]
+tests/test_bounty_arbiter.py::test_submit_report_when_program_inactive_reverts PASSED [ 92%]
+tests/test_bounty_arbiter.py::test_submit_report_input_validation PASSED         [ 96%]
 tests/test_bounty_arbiter.py::test_administrative_methods_and_access_control PASSED [100%]
 
-============================= 18 passed in 2.23s ==============================
+============================= 25 passed in 4.37s ==============================
 ```
 
 ---
