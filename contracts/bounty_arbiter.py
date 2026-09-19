@@ -1,19 +1,19 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 import json
-import re
 from dataclasses import dataclass
 from genlayer import *
 
 ALLOWED_SEVERITIES = {"NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
 SEVERITY_RANKS = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
+
 @allow_storage
 @dataclass
 class Report:
     id: u256
     researcher: str
-    target_component: str
+    target_evidence_url: str
     valid: bool
     severity: str
     rationale: str
@@ -26,25 +26,35 @@ class BugBountyArbiter(gl.Contract):
     Autonomous Bug Bounty Triage & Severity Arbiter (BugBountyArbiter)
 
     A decentralized smart contract primitive for GenLayer that automates vulnerability
-    report intake, live policy-grounded multi-validator AI triage, exact severity consensus,
-    and on-chain payout settlement while preserving strict state hygiene.
+    report intake, live policy-grounded and target-evidence-grounded multi-validator AI triage,
+    fail-closed consensus, exact severity consensus, and on-chain payout settlement while
+    preserving strict state hygiene and authoritative domain boundaries.
     """
 
     project_owner: str
     scope_policy_url: str
+    authoritative_target_prefix: str
     is_active: bool
     total_submissions: u256
     payout_table: TreeMap[str, u256]
     reports: TreeMap[u256, Report]
 
-    def __init__(self, project_owner: str, scope_policy_url: str):
+    def __init__(
+        self,
+        project_owner: str,
+        scope_policy_url: str,
+        authoritative_target_prefix: str,
+    ):
         if not project_owner or not str(project_owner).strip():
             raise gl.vm.UserError("Project owner identifier cannot be empty")
         if not scope_policy_url or not str(scope_policy_url).strip():
             raise gl.vm.UserError("Scope policy URL cannot be empty")
+        if not authoritative_target_prefix or not str(authoritative_target_prefix).strip():
+            raise gl.vm.UserError("Authoritative target prefix cannot be empty")
 
         self.project_owner = str(project_owner).strip()
         self.scope_policy_url = str(scope_policy_url).strip()
+        self.authoritative_target_prefix = str(authoritative_target_prefix).strip()
         self.is_active = True
         self.total_submissions = u256(0)
 
@@ -65,16 +75,15 @@ class BugBountyArbiter(gl.Contract):
     def submit_report(
         self,
         researcher: str,
-        target_component: str,
+        target_evidence_url: str,
         vulnerability_details: str,
-        target_evidence_url: str = "",
     ) -> int:
         """
         Submit a security vulnerability report for multi-validator AI adjudication.
 
-        Runs non-deterministic triage via gl.vm.run_nondet_unsafe:
-        1. Live web retrieval of the authoritative scope policy via gl.nondet.web.get.
-        2. Live web retrieval / verification of target evidence endpoint if provided.
+        Runs non-deterministic triage via gl.vm.run_nondet:
+        1. Enforces strict authoritative domain boundary on target_evidence_url.
+        2. Strict fail-closed live acquisition of both scope policy and target evidence.
         3. Multi-validator comparative Equivalence Principle enforcing exact agreement on
            validity boolean and exact severity tier to deterministically bind payout_due.
         """
@@ -82,95 +91,87 @@ class BugBountyArbiter(gl.Contract):
             raise gl.vm.UserError("Bounty program is currently paused or inactive")
 
         clean_researcher = str(researcher).strip() if researcher else ""
-        clean_component = str(target_component).strip() if target_component else ""
-        clean_details = str(vulnerability_details).strip() if vulnerability_details else ""
         clean_evidence_url = str(target_evidence_url).strip() if target_evidence_url else ""
+        clean_details = str(vulnerability_details).strip() if vulnerability_details else ""
 
         if not clean_researcher:
             raise gl.vm.UserError("Researcher identity/address cannot be empty")
-        if not clean_component:
-            raise gl.vm.UserError("Target component cannot be empty")
+        if not clean_evidence_url:
+            raise gl.vm.UserError("Target evidence URL cannot be empty")
         if not clean_details:
             raise gl.vm.UserError("Vulnerability details cannot be empty")
 
+        # Enforce Authority: Verify that target_evidence_url.startswith(self.authoritative_target_prefix)
+        if not clean_evidence_url.startswith(self.authoritative_target_prefix):
+            raise gl.vm.UserError("Evidence URL violates authoritative domain boundary")
+
         policy_url = self.scope_policy_url
-        if not policy_url:
-            raise gl.vm.UserError("Scope policy URL cannot be empty")
-
-        # Resolve evidence URL from explicit argument, target component, or details text
-        evidence_url = clean_evidence_url
-        if not evidence_url:
-            if clean_component.startswith(("http://", "https://")):
-                evidence_url = clean_component
-            else:
-                url_match = re.search(r'https?://[^\s<>"\')]+', clean_details)
-                if url_match and url_match.group(0) != policy_url:
-                    evidence_url = url_match.group(0)
-
-        if evidence_url and not (evidence_url.startswith("http://") or evidence_url.startswith("https://")):
-            evidence_url = "https://" + evidence_url
+        prefix = self.authoritative_target_prefix
 
         def leader_fn() -> dict:
-            # 1. Live web retrieval of authoritative scope policy
+            # 1. Fetch scope policy with fail-closed checks
             try:
                 policy_res = gl.nondet.web.get(policy_url)
-                if policy_res.status != 200:
-                    raise gl.vm.UserError(
-                        f"Failed to fetch scope policy from {policy_url}: HTTP status {policy_res.status}"
-                    )
-                policy_body_bytes = policy_res.body or b""
-                policy_text = policy_body_bytes.decode("utf-8", errors="replace").strip()
-                if not policy_text:
-                    raise gl.vm.UserError("Scope policy content is empty")
-            except gl.vm.UserError:
-                raise
-            except Exception as e:
-                raise gl.vm.UserError(f"Failed to fetch scope policy: {e}")
+            except Exception:
+                raise gl.vm.UserError(
+                    "Failed to acquire authoritative scope policy or target evidence; failing closed."
+                )
 
-            # Safely truncate policy to prevent LLM context token overflow
+            if policy_res.status != 200:
+                raise gl.vm.UserError(
+                    "Failed to acquire authoritative scope policy or target evidence; failing closed."
+                )
+
+            policy_bytes = policy_res.body or b""
+            policy_text = policy_bytes.decode("utf-8", errors="replace").strip()
+            if not policy_text:
+                raise gl.vm.UserError(
+                    "Failed to acquire authoritative scope policy or target evidence; failing closed."
+                )
+
+            # 2. Fetch target evidence with fail-closed checks
+            try:
+                evidence_res = gl.nondet.web.get(clean_evidence_url)
+            except Exception:
+                raise gl.vm.UserError(
+                    "Failed to acquire authoritative scope policy or target evidence; failing closed."
+                )
+
+            if evidence_res.status != 200:
+                raise gl.vm.UserError(
+                    "Failed to acquire authoritative scope policy or target evidence; failing closed."
+                )
+
+            evidence_bytes = evidence_res.body or b""
+            evidence_text = evidence_bytes.decode("utf-8", errors="replace").strip()
+            if not evidence_text:
+                raise gl.vm.UserError(
+                    "Failed to acquire authoritative scope policy or target evidence; failing closed."
+                )
+
+            # 3. Safe truncation for prompt context
             policy_snippet = policy_text[:4000]
-
-            # 2. Live target endpoint / evidence retrieval to ground report in verifiable reality
-            evidence_context = ""
-            if evidence_url:
-                try:
-                    ev_res = gl.nondet.web.get(evidence_url)
-                    ev_status = ev_res.status
-                    ev_body_bytes = (ev_res.body or b"")[:1500]
-                    ev_body_sample = ev_body_bytes.decode("utf-8", errors="replace")
-                    ev_headers = {
-                        k: (v.decode("utf-8", errors="replace") if isinstance(v, bytes) else str(v))
-                        for k, v in list((ev_res.headers or {}).items())[:5]
-                    }
-                    evidence_context = (
-                        f"\n\n=== LIVE TARGET EVIDENCE VERIFICATION ===\n"
-                        f"Target Evidence URL: {evidence_url}\n"
-                        f"HTTP Response Status: {ev_status}\n"
-                        f"Response Headers Sample: {json.dumps(ev_headers)}\n"
-                        f"Response Body Sample: {ev_body_sample}\n"
-                    )
-                except Exception as e:
-                    evidence_context = (
-                        f"\n\n=== LIVE TARGET EVIDENCE VERIFICATION ===\n"
-                        f"Target Evidence URL: {evidence_url}\n"
-                        f"Verification Notice: Failed to retrieve live target evidence ({e})\n"
-                    )
+            evidence_snippet = evidence_text[:4000]
 
             prompt = f"""You are an autonomous smart contract security auditor and bug bounty arbiter.
-Evaluate the following vulnerability report submitted against the specified target component.
+Evaluate the following vulnerability report submitted with authoritative target evidence against the project's scope policy.
 
-=== AUTHORITATIVE SCOPE POLICY (from {policy_url}) ===
+=== AUTHORITATIVE SCOPE POLICY ({policy_url}) ===
 {policy_snippet}
 
-=== SUBMISSION DETAILS ===
-Target Component: {clean_component}
-Submission Details:
-\"\"\"{clean_details}\"\"\"{evidence_context}
+=== AUTHORITATIVE TARGET EVIDENCE / REPRODUCIBLE PROOF ({clean_evidence_url}) ===
+{evidence_snippet}
+
+=== RESEARCHER SUBMISSION DETAILS ===
+Researcher: {clean_researcher}
+Target Evidence URL: {clean_evidence_url}
+Vulnerability Details & Steps to Reproduce:
+\"\"\"{clean_details}\"\"\"
 
 Evaluation Guidelines:
-1. Assess whether the submission describes a genuine, in-scope security vulnerability affecting '{clean_component}' based strictly on the authoritative scope policy.
-2. If live target evidence is provided, verify whether the reported behavior aligns with the live endpoint responses. If evidence refutes the claim or shows intended behavior, evaluate accordingly.
-3. "valid": Set to true if the report details a real in-scope security flaw. Set to false if it is spam, invalid, informational only, out-of-scope per policy, intended behavior, or refuted by live evidence.
+1. Objectively verify whether the fetched target evidence/code demonstrates the claimed exploit or vulnerability against the authoritative scope policy.
+2. If the claimed vulnerability is refuted by the authoritative evidence, out of scope, intended functionality, or non-reproducible, mark it invalid.
+3. "valid": Set to true ONLY IF the fetched target evidence objectively demonstrates a genuine, in-scope security vulnerability. Set to false otherwise.
 4. "severity": Standard classification tier strictly chosen from: "NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL".
    - If "valid" is false, "severity" MUST strictly be "NONE".
    - If "valid" is true, assign "LOW", "MEDIUM", "HIGH", or "CRITICAL" reflecting practical exploitability, financial/governance impact, and scope policy definitions.
@@ -180,7 +181,7 @@ Return strictly a JSON object conforming to:
 {{
   "valid": true,
   "severity": "CRITICAL",
-  "rationale": "High impact exploitability reasoning"
+  "rationale": "High impact exploitability verified with authoritative evidence."
 }}"""
             raw_res = gl.nondet.exec_prompt(prompt, response_format="json")
             if isinstance(raw_res, str):
@@ -205,7 +206,7 @@ Return strictly a JSON object conforming to:
 
             rationale = str(raw_res.get("rationale", "")).strip()[:280]
             if not rationale:
-                rationale = "Triage completed based on vulnerability specification."
+                rationale = "Triage completed based on authoritative evidence."
 
             return {
                 "valid": valid_val,
@@ -246,7 +247,14 @@ Return strictly a JSON object conforming to:
             if leader_valid and leader_sev == "NONE":
                 return False
 
-            # 5. Validator independently runs evaluation (including independent web fetch & prompt)
+            # 5. Independent Authority Validation:
+            # Validators independently verify that the target evidence URL obeys the authoritative prefix
+            if not clean_evidence_url.startswith(prefix):
+                return False
+
+            # 6. Validator independently runs leader_fn()
+            # This independently fetches both URLs (failing closed if unavailable/empty/non-200)
+            # and runs the LLM evaluation.
             try:
                 val_payload = leader_fn()
             except Exception:
@@ -258,15 +266,15 @@ Return strictly a JSON object conforming to:
             val_valid = val_payload.get("valid")
             val_sev = str(val_payload.get("severity", "")).strip().upper()
 
-            # 6. Equivalence Principle: Strict equality on 'valid' boolean
+            # 7. Equivalence Principle: Strict equality on 'valid' boolean
             if leader_valid != val_valid:
                 return False
 
-            # 7. Ensure validator severity matches standard tiers
+            # 8. Ensure validator severity matches standard tiers
             if val_sev not in ALLOWED_SEVERITIES:
                 return False
 
-            # 8. Strict Severity Equivalence (Exact Binding):
+            # 9. Strict Severity Equivalence (Exact Binding):
             # Because severity tier directly indexes into self.payout_table (payout_due),
             # validators MUST independently agree on the EXACT severity tier.
             # Zero tolerance for adjacent tier drift or divergence.
@@ -275,7 +283,7 @@ Return strictly a JSON object conforming to:
 
             return True
 
-        adjudication = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        adjudication = gl.vm.run_nondet(leader_fn, validator_fn)
 
         is_valid = bool(adjudication["valid"])
         severity = str(adjudication["severity"]).strip().upper()
@@ -294,7 +302,7 @@ Return strictly a JSON object conforming to:
         self.reports[u256(new_report_id)] = Report(
             id=u256(new_report_id),
             researcher=clean_researcher,
-            target_component=clean_component,
+            target_evidence_url=clean_evidence_url,
             valid=is_valid,
             severity=severity,
             rationale=rationale,
@@ -341,7 +349,7 @@ Return strictly a JSON object conforming to:
         return {
             "id": int(r.id),
             "researcher": str(r.researcher),
-            "target_component": str(r.target_component),
+            "target_evidence_url": str(r.target_evidence_url),
             "valid": bool(r.valid),
             "severity": str(r.severity),
             "rationale": str(r.rationale),
@@ -357,6 +365,7 @@ Return strictly a JSON object conforming to:
         return {
             "project_owner": str(self.project_owner),
             "scope_policy_url": str(self.scope_policy_url),
+            "authoritative_target_prefix": str(self.authoritative_target_prefix),
             "is_active": bool(self.is_active),
             "total_submissions": int(self.total_submissions),
             "payout_table": {
@@ -393,3 +402,12 @@ Return strictly a JSON object conforming to:
         if not clean_url:
             raise gl.vm.UserError("Scope policy URL cannot be empty")
         self.scope_policy_url = clean_url
+
+    @gl.public.write
+    def update_authoritative_target_prefix(self, new_prefix: str) -> None:
+        """Administrative method to update the authoritative target prefix."""
+        self._require_owner()
+        clean_prefix = str(new_prefix).strip() if new_prefix else ""
+        if not clean_prefix:
+            raise gl.vm.UserError("Authoritative target prefix cannot be empty")
+        self.authoritative_target_prefix = clean_prefix
