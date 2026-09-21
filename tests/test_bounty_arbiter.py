@@ -106,11 +106,32 @@ def test_initialization_empty_target_prefix_reverts(direct_vm, direct_deploy):
         direct_deploy("contracts/bounty_arbiter.py", "0xOwner", DEFAULT_POLICY_URL, "")
 
 
+def test_initialization_insecure_policy_url_reverts(direct_vm, direct_deploy):
+    with direct_vm.expect_revert("scheme must be https"):
+        direct_deploy(
+            "contracts/bounty_arbiter.py",
+            "0xOwner",
+            "http://security.example.io/policy.md",
+            DEFAULT_TARGET_PREFIX,
+        )
+
+
+def test_initialization_insecure_target_prefix_reverts(direct_vm, direct_deploy):
+    with direct_vm.expect_revert("scheme must be https"):
+        direct_deploy(
+            "contracts/bounty_arbiter.py",
+            "0xOwner",
+            DEFAULT_POLICY_URL,
+            "http://raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter/",
+        )
+
+
+
 def test_evidence_url_authority_boundary_validation(direct_vm, direct_deploy, direct_alice):
     """
-    Enforce Authority: Verify that target_evidence_url must start with authoritative_target_prefix.
-    Non-matching URLs revert immediately with 'Evidence URL violates authoritative domain boundary'
-    and create zero report state.
+    Robust Parsed Origin & Path-Boundary Validation:
+    Rejects lookalike domains, domain typos, insecure schemes, lookalike path prefixes,
+    credentials/userinfo, query strings, and path traversal elements.
     """
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
@@ -121,21 +142,87 @@ def test_evidence_url_authority_boundary_validation(direct_vm, direct_deploy, di
     direct_vm.sender = direct_alice
 
     unauthorized_urls = [
+        # External / unauthorized domains
         "https://attacker.evil.com/fake_proof.sol",
         "https://raw.githubusercontent.com/MaliciousActor/exploit/main.sol",
         "https://pastebin.com/raw/exploit",
+        # Lookalike domain attacks
+        "https://raw.githubusercontent.com.attacker.com/JimmyOgb/bug-bounty-arbiter/main/VaultCore.sol",
+        "https://raw.githubusercontent.evil.com/JimmyOgb/bug-bounty-arbiter/main/VaultCore.sol",
+        # Domain typos
+        "https://raw.githybusercontent.com/JimmyOgb/bug-bounty-arbiter/main/VaultCore.sol",
+        "https://raw.githubbusercontent.com/JimmyOgb/bug-bounty-arbiter/main/VaultCore.sol",
+        # Insecure scheme (http)
+        "http://raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter/main/contracts/VaultCore.sol",
+        # Lookalike path prefixes (same root name without delimiter)
+        "https://raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter-fake/main/contracts/VaultCore.sol",
+        "https://raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter_phishing/main/contracts/VaultCore.sol",
+        "https://raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter-clone/main/contracts/VaultCore.sol",
+        # Query string injection
+        "https://raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter/main/contracts/VaultCore.sol?token=secret",
+        # Embedded credentials / userinfo
+        "https://attacker:secret@raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter/main/contracts/VaultCore.sol",
+        # Path traversal elements
+        "https://raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter/../../evil/exploit.sol",
+        "https://raw.githubusercontent.com/JimmyOgb/bug-bounty-arbiter/%2e%2e/evil/exploit.sol",
     ]
 
     for unauth_url in unauthorized_urls:
         with direct_vm.expect_revert("Evidence URL violates authoritative domain boundary"):
             contract.submit_report(
-                "0xResearcher",
                 unauth_url,
                 "Exploit details pointing outside authoritative boundary",
             )
 
     status = contract.get_program_status()
     assert status["total_submissions"] == 0
+
+
+def test_authenticated_submitter_binding(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """
+    Secure Submitter Binding:
+    Reports are automatically bound to the transaction caller (gl.message.sender).
+    Callers cannot spoof the researcher identity.
+    """
+    contract = direct_deploy(
+        "contracts/bounty_arbiter.py",
+        "0x" + direct_alice.hex(),
+        DEFAULT_POLICY_URL,
+        DEFAULT_TARGET_PREFIX,
+    )
+
+    llm_payload = {
+        "valid": True,
+        "severity": "HIGH",
+        "rationale": "High severity finding bound to caller.",
+    }
+    direct_vm.mock_llm(r".*", json.dumps(llm_payload))
+
+    # 1. Alice submits report #1
+    direct_vm.sender = direct_alice
+    rep_id_1 = contract.submit_report(
+        DEFAULT_EVIDENCE_URL,
+        "Vulnerability found by Alice.",
+    )
+    assert rep_id_1 == 1
+
+    report_1 = contract.get_report(1)
+    assert report_1["researcher"].lower() == ("0x" + direct_alice.hex()).lower()
+    adjudicated_1 = contract.get_adjudicated_report(1)
+    assert str(adjudicated_1.researcher).lower() == ("0x" + direct_alice.hex()).lower()
+
+    # 2. Bob submits report #2
+    direct_vm.sender = direct_bob
+    rep_id_2 = contract.submit_report(
+        DEFAULT_EVIDENCE_URL,
+        "Vulnerability found by Bob.",
+    )
+    assert rep_id_2 == 2
+
+    report_2 = contract.get_report(2)
+    assert report_2["researcher"].lower() == ("0x" + direct_bob.hex()).lower()
+    adjudicated_2 = contract.get_adjudicated_report(2)
+    assert str(adjudicated_2.researcher).lower() == ("0x" + direct_bob.hex()).lower()
 
 
 def test_submit_report_valid_critical(direct_vm, direct_deploy, direct_alice):
@@ -155,7 +242,6 @@ def test_submit_report_valid_critical(direct_vm, direct_deploy, direct_alice):
     direct_vm.mock_llm(r".*", json.dumps(llm_payload))
 
     report_id = contract.submit_report(
-        "0xResearcher1",
         DEFAULT_EVIDENCE_URL,
         "Reentrancy vector identified via cross-function state update desync in VaultCore.",
     )
@@ -168,13 +254,21 @@ def test_submit_report_valid_critical(direct_vm, direct_deploy, direct_alice):
     # Check on-chain stored metadata
     report = contract.get_report(1)
     assert report["id"] == 1
-    assert report["researcher"] == "0xResearcher1"
+    assert report["researcher"].lower() == ("0x" + direct_alice.hex()).lower()
     assert report["target_evidence_url"] == DEFAULT_EVIDENCE_URL
     assert report["valid"] is True
     assert report["severity"] == "CRITICAL"
     assert report["rationale"] == "Reentrancy in withdrawAll() allows full pool drain."
-    assert report["payout_due"] == 5000
-    assert report["claimed"] is False
+    assert report["recommended_payout_units"] == 5000
+    assert "claimed" not in report
+
+    # Check get_adjudicated_report interface
+    adjudicated = contract.get_adjudicated_report(1)
+    assert int(adjudicated.id) == 1
+    assert str(adjudicated.researcher).lower() == ("0x" + direct_alice.hex()).lower()
+    assert adjudicated.valid is True
+    assert adjudicated.severity == "CRITICAL"
+    assert int(adjudicated.recommended_payout_units) == 5000
 
     # Check program status reflects submission count
     status = contract.get_program_status()
@@ -206,7 +300,6 @@ def test_submit_report_valid_tiers(direct_vm, direct_deploy, direct_alice):
         )
 
         rep_id = contract.submit_report(
-            f"0xResearcher_{tier}",
             DEFAULT_EVIDENCE_URL,
             f"Technical report details for {tier}",
         )
@@ -218,14 +311,19 @@ def test_submit_report_valid_tiers(direct_vm, direct_deploy, direct_alice):
         rep = contract.get_report(rep_id)
         assert rep["valid"] is True
         assert rep["severity"] == tier
-        assert rep["payout_due"] == expected_payout
-        assert rep["claimed"] is False
+        assert rep["recommended_payout_units"] == expected_payout
+        assert "claimed" not in rep
+
+        adj = contract.get_adjudicated_report(rep_id)
+        assert adj.valid is True
+        assert adj.severity == tier
+        assert int(adj.recommended_payout_units) == expected_payout
 
 
 def test_submit_report_invalid_creates_no_payout_liability(direct_vm, direct_deploy, direct_alice):
     """
-    Submitting an invalid report or spam results in valid=False, severity=NONE, payout_due=0.
-    No payout liability can be claimed.
+    Submitting an invalid report results in valid=False, severity=NONE, recommended_payout_units=0.
+    No payout recommendation is certified.
     """
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
@@ -245,7 +343,6 @@ def test_submit_report_invalid_creates_no_payout_liability(direct_vm, direct_dep
     )
 
     report_id = contract.submit_report(
-        "0xSpammer",
         DEFAULT_EVIDENCE_URL,
         "Token can be transferred to any address.",
     )
@@ -257,18 +354,19 @@ def test_submit_report_invalid_creates_no_payout_liability(direct_vm, direct_dep
     report = contract.get_report(1)
     assert report["valid"] is False
     assert report["severity"] == "NONE"
-    assert report["payout_due"] == 0
-    assert report["claimed"] is False
+    assert report["recommended_payout_units"] == 0
+    assert "claimed" not in report
 
-    # Ensure no payout can ever be claimed
-    with direct_vm.expect_revert("Cannot claim payout on invalid or rejected report"):
-        contract.claim_payout(1)
+    adj = contract.get_adjudicated_report(1)
+    assert adj.valid is False
+    assert adj.severity == "NONE"
+    assert int(adj.recommended_payout_units) == 0
 
 
 def test_fail_closed_policy_fetch_http_error(direct_vm, direct_deploy, direct_alice):
     """
     Fail-Closed Gate: If scope policy fetch returns non-200 (404/500), execution immediately reverts
-    before any report state or payout liability is recorded.
+    before any report state is recorded.
     """
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
@@ -284,7 +382,7 @@ def test_fail_closed_policy_fetch_http_error(direct_vm, direct_deploy, direct_al
     mock_evidence(direct_vm, status=200, body=DEFAULT_EVIDENCE_BODY)
 
     with direct_vm.expect_revert("Failed to acquire authoritative scope policy or target evidence; failing closed."):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Bug details")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Bug details")
 
     # Mock HTTP 500 failure on policy
     direct_vm.clear_mocks()
@@ -292,7 +390,7 @@ def test_fail_closed_policy_fetch_http_error(direct_vm, direct_deploy, direct_al
     mock_evidence(direct_vm, status=200, body=DEFAULT_EVIDENCE_BODY)
 
     with direct_vm.expect_revert("Failed to acquire authoritative scope policy or target evidence; failing closed."):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Bug details")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Bug details")
 
     status = contract.get_program_status()
     assert status["total_submissions"] == 0
@@ -315,7 +413,7 @@ def test_fail_closed_policy_fetch_empty_body(direct_vm, direct_deploy, direct_al
     mock_evidence(direct_vm, status=200, body=DEFAULT_EVIDENCE_BODY)
 
     with direct_vm.expect_revert("Failed to acquire authoritative scope policy or target evidence; failing closed."):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Bug details")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Bug details")
 
     assert contract.get_program_status()["total_submissions"] == 0
 
@@ -323,7 +421,7 @@ def test_fail_closed_policy_fetch_empty_body(direct_vm, direct_deploy, direct_al
 def test_fail_closed_evidence_fetch_http_error(direct_vm, direct_deploy, direct_alice):
     """
     Fail-Closed Gate: If target evidence fetch returns non-200 (404/500), execution immediately reverts
-    before any report state or payout liability is recorded.
+    before any report state is recorded.
     """
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
@@ -339,7 +437,7 @@ def test_fail_closed_evidence_fetch_http_error(direct_vm, direct_deploy, direct_
     mock_evidence(direct_vm, status=404, body="Evidence Not Found")
 
     with direct_vm.expect_revert("Failed to acquire authoritative scope policy or target evidence; failing closed."):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Bug details")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Bug details")
 
     # Mock HTTP 500 failure on evidence
     direct_vm.clear_mocks()
@@ -347,7 +445,7 @@ def test_fail_closed_evidence_fetch_http_error(direct_vm, direct_deploy, direct_
     mock_evidence(direct_vm, status=500, body="Internal Server Error")
 
     with direct_vm.expect_revert("Failed to acquire authoritative scope policy or target evidence; failing closed."):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Bug details")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Bug details")
 
     assert contract.get_program_status()["total_submissions"] == 0
 
@@ -369,7 +467,7 @@ def test_fail_closed_evidence_fetch_empty_body(direct_vm, direct_deploy, direct_
     mock_evidence(direct_vm, status=200, body="")
 
     with direct_vm.expect_revert("Failed to acquire authoritative scope policy or target evidence; failing closed."):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Bug details")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Bug details")
 
     assert contract.get_program_status()["total_submissions"] == 0
 
@@ -388,7 +486,7 @@ def test_fail_closed_missing_mock_or_network_failure(direct_vm, direct_deploy, d
 
     direct_vm.clear_mocks()
     with direct_vm.expect_revert("Failed to acquire authoritative scope policy or target evidence; failing closed."):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Bug details")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Bug details")
 
     assert contract.get_program_status()["total_submissions"] == 0
 
@@ -433,7 +531,6 @@ def test_authoritative_evidence_and_policy_injected_into_prompt(direct_vm, direc
     )
 
     rep_id = contract.submit_report(
-        "0xAlice",
         custom_evidence_url,
         "Issue grounded in authoritative policy and code",
     )
@@ -466,7 +563,6 @@ def test_validator_rejection_validity_disagreement(direct_vm, direct_deploy, dir
     )
 
     contract.submit_report(
-        "0xResearcher",
         DEFAULT_EVIDENCE_URL,
         "Reward calculation rounding issue",
     )
@@ -512,7 +608,7 @@ def test_validator_rejection_adjacent_severity_mismatch(direct_vm, direct_deploy
             json.dumps({"valid": True, "severity": leader_tier, "rationale": f"Leader saw {leader_tier}"}),
         )
 
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Price feed latency manipulation")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Price feed latency manipulation")
 
         # Validator independently evaluates same report as adjacent tier
         direct_vm.clear_mocks()
@@ -545,7 +641,7 @@ def test_validator_rejection_major_severity_divergence(direct_vm, direct_deploy,
         r".*",
         json.dumps({"valid": True, "severity": "CRITICAL", "rationale": "Critical threat"}),
     )
-    contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Price manipulation")
+    contract.submit_report(DEFAULT_EVIDENCE_URL, "Price manipulation")
 
     # Validator independently evaluates same report as LOW
     direct_vm.clear_mocks()
@@ -563,7 +659,7 @@ def test_validator_rejection_major_severity_divergence(direct_vm, direct_deploy,
 def test_validator_acceptance_exact_severity_match(direct_vm, direct_deploy, direct_alice):
     """
     Exact Binding: When leader and validator independently agree on the exact same
-    severity tier and validity, consensus succeeds and locks the exact deterministic payout.
+    severity tier and validity, consensus succeeds and locks the exact deterministic recommended units.
     """
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
@@ -589,13 +685,18 @@ def test_validator_acceptance_exact_severity_match(direct_vm, direct_deploy, dir
             json.dumps({"valid": True, "severity": tier, "rationale": f"Exact agreement on {tier}"}),
         )
 
-        rep_id = contract.submit_report(f"0xResearcher_{tier}", DEFAULT_EVIDENCE_URL, f"Vulnerability {tier}")
+        rep_id = contract.submit_report(DEFAULT_EVIDENCE_URL, f"Vulnerability {tier}")
         assert direct_vm.run_validator() is True
 
         rep = contract.get_report(rep_id)
         assert rep["valid"] is True
         assert rep["severity"] == tier
-        assert rep["payout_due"] == payout
+        assert rep["recommended_payout_units"] == payout
+
+        adj = contract.get_adjudicated_report(rep_id)
+        assert adj.valid is True
+        assert adj.severity == tier
+        assert int(adj.recommended_payout_units) == payout
 
 
 def test_validator_rejection_hallucinated_severity_tier(direct_vm, direct_deploy, direct_alice):
@@ -611,7 +712,7 @@ def test_validator_rejection_hallucinated_severity_tier(direct_vm, direct_deploy
         r".*",
         json.dumps({"valid": True, "severity": "HIGH", "rationale": "Valid issue"}),
     )
-    contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Cross-chain relay bug")
+    contract.submit_report(DEFAULT_EVIDENCE_URL, "Cross-chain relay bug")
 
     hallucinated_leader_result = {
         "valid": True,
@@ -635,7 +736,7 @@ def test_validator_rejection_semantic_contradiction(direct_vm, direct_deploy, di
         r".*",
         json.dumps({"valid": True, "severity": "HIGH", "rationale": "Valid issue"}),
     )
-    contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Relay bug")
+    contract.submit_report(DEFAULT_EVIDENCE_URL, "Relay bug")
 
     # Contradiction 1: valid=False but severity="CRITICAL"
     bad_res_1 = {"valid": False, "severity": "CRITICAL", "rationale": "Invalid yet critical"}
@@ -659,7 +760,7 @@ def test_validator_rejection_malformed_schema(direct_vm, direct_deploy, direct_a
         r".*",
         json.dumps({"valid": True, "severity": "HIGH", "rationale": "Valid issue"}),
     )
-    contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Relay bug")
+    contract.submit_report(DEFAULT_EVIDENCE_URL, "Relay bug")
 
     assert direct_vm.run_validator(leader_result={"severity": "HIGH", "rationale": "Missing valid"}) is False
     assert direct_vm.run_validator(leader_result={"valid": True, "rationale": "Missing severity"}) is False
@@ -667,7 +768,12 @@ def test_validator_rejection_malformed_schema(direct_vm, direct_deploy, direct_a
     assert direct_vm.run_validator(leader_result="unexpected string result") is False
 
 
-def test_claim_payout_flow(direct_vm, direct_deploy, direct_alice):
+def test_adjudicated_report_metadata_oracle_primitive(direct_vm, direct_deploy, direct_alice):
+    """
+    Adjudication Arbiter & Oracle Primitive:
+    Contract certifies report validity and recommended units as immutable adjudication metadata.
+    There is no hollow claim_payout write method or claimed flag.
+    """
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
         "0x" + direct_alice.hex(),
@@ -681,38 +787,76 @@ def test_claim_payout_flow(direct_vm, direct_deploy, direct_alice):
         json.dumps({"valid": True, "severity": "HIGH", "rationale": "High severity finding"}),
     )
 
-    rep_id = contract.submit_report("0xAlice", DEFAULT_EVIDENCE_URL, "Slippage bug")
+    rep_id = contract.submit_report(DEFAULT_EVIDENCE_URL, "Slippage bug")
     assert rep_id == 1
 
-    claimed_amount = contract.claim_payout(1)
-    assert claimed_amount == 2000
+    # Verify get_adjudicated_report read interface for downstream consumers
+    adjudicated = contract.get_adjudicated_report(1)
+    assert int(adjudicated.id) == 1
+    assert str(adjudicated.researcher).lower() == ("0x" + direct_alice.hex()).lower()
+    assert adjudicated.target_evidence_url == DEFAULT_EVIDENCE_URL
+    assert adjudicated.valid is True
+    assert adjudicated.severity == "HIGH"
+    assert adjudicated.rationale == "High severity finding"
+    assert int(adjudicated.recommended_payout_units) == 2000
 
-    rep = contract.get_report(1)
-    assert rep["claimed"] is True
+    # Ensure claim_payout write method is completely removed
+    assert not hasattr(contract, "claim_payout"), "claim_payout method must be removed"
+
+    # Ensure get_report contains clean adjudication metadata without dead claimed flag
+    report = contract.get_report(1)
+    assert "claimed" not in report
+    assert report["recommended_payout_units"] == 2000
 
 
-def test_claim_payout_gating_double_claim_reverts(direct_vm, direct_deploy, direct_alice):
+def test_adjudication_metadata_immutability_and_clean_queries(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """
+    Verify multiple submissions produce distinct immutable metadata records, and queries
+    contain clean metadata without dead claim paths.
+    """
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
         "0x" + direct_alice.hex(),
         DEFAULT_POLICY_URL,
         DEFAULT_TARGET_PREFIX,
     )
-    direct_vm.sender = direct_alice
 
+    # 1. Alice report (MEDIUM)
+    direct_vm.sender = direct_alice
     direct_vm.mock_llm(
         r".*",
         json.dumps({"valid": True, "severity": "MEDIUM", "rationale": "Medium finding"}),
     )
-    rep_id = contract.submit_report("0xAlice", DEFAULT_EVIDENCE_URL, "Issue")
+    rep_1 = contract.submit_report(DEFAULT_EVIDENCE_URL, "Medium issue")
 
-    contract.claim_payout(rep_id)
+    # 2. Bob report (CRITICAL)
+    direct_vm.sender = direct_bob
+    direct_vm.clear_mocks()
+    mock_policy(direct_vm)
+    mock_evidence(direct_vm)
+    direct_vm.mock_llm(
+        r".*",
+        json.dumps({"valid": True, "severity": "CRITICAL", "rationale": "Critical finding"}),
+    )
+    rep_2 = contract.submit_report(DEFAULT_EVIDENCE_URL, "Critical issue")
 
-    with direct_vm.expect_revert("Payout has already been claimed for this report"):
-        contract.claim_payout(rep_id)
+    # Verify Report 1
+    adj_1 = contract.get_adjudicated_report(rep_1)
+    assert int(adj_1.id) == 1
+    assert str(adj_1.researcher).lower() == ("0x" + direct_alice.hex()).lower()
+    assert adj_1.severity == "MEDIUM"
+    assert int(adj_1.recommended_payout_units) == 500
+
+    # Verify Report 2
+    adj_2 = contract.get_adjudicated_report(rep_2)
+    assert int(adj_2.id) == 2
+    assert str(adj_2.researcher).lower() == ("0x" + direct_bob.hex()).lower()
+    assert adj_2.severity == "CRITICAL"
+    assert int(adj_2.recommended_payout_units) == 5000
 
 
-def test_claim_payout_gating_invalid_report_reverts(direct_vm, direct_deploy, direct_alice):
+def test_adjudication_metadata_invalid_report_zero_units(direct_vm, direct_deploy, direct_alice):
+    """Invalid report sets recommended units to 0 and valid to False."""
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
         "0x" + direct_alice.hex(),
@@ -725,13 +869,16 @@ def test_claim_payout_gating_invalid_report_reverts(direct_vm, direct_deploy, di
         r".*",
         json.dumps({"valid": False, "severity": "NONE", "rationale": "Not a vulnerability"}),
     )
-    rep_id = contract.submit_report("0xAlice", DEFAULT_EVIDENCE_URL, "Issue")
+    rep_id = contract.submit_report(DEFAULT_EVIDENCE_URL, "Non-issue")
 
-    with direct_vm.expect_revert("Cannot claim payout on invalid or rejected report"):
-        contract.claim_payout(rep_id)
+    adj = contract.get_adjudicated_report(rep_id)
+    assert adj.valid is False
+    assert adj.severity == "NONE"
+    assert int(adj.recommended_payout_units) == 0
 
 
-def test_claim_payout_nonexistent_report_reverts(direct_vm, direct_deploy, direct_alice):
+def test_get_adjudicated_report_nonexistent_reverts(direct_vm, direct_deploy, direct_alice):
+    """Querying non-existent report IDs reverts safely."""
     contract = direct_deploy(
         "contracts/bounty_arbiter.py",
         "0x" + direct_alice.hex(),
@@ -741,10 +888,10 @@ def test_claim_payout_nonexistent_report_reverts(direct_vm, direct_deploy, direc
     direct_vm.sender = direct_alice
 
     with direct_vm.expect_revert("Report does not exist"):
-        contract.claim_payout(999)
+        contract.get_adjudicated_report(999)
 
     with direct_vm.expect_revert("Report does not exist"):
-        contract.claim_payout(0)
+        contract.get_adjudicated_report(0)
 
 
 def test_submit_report_when_program_inactive_reverts(direct_vm, direct_deploy, direct_alice):
@@ -762,7 +909,7 @@ def test_submit_report_when_program_inactive_reverts(direct_vm, direct_deploy, d
     assert status["is_active"] is False
 
     with direct_vm.expect_revert("Bounty program is currently paused or inactive"):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "Exploit details")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "Exploit details")
 
 
 def test_submit_report_input_validation(direct_vm, direct_deploy, direct_alice):
@@ -774,14 +921,11 @@ def test_submit_report_input_validation(direct_vm, direct_deploy, direct_alice):
     )
     direct_vm.sender = direct_alice
 
-    with direct_vm.expect_revert("Researcher identity/address cannot be empty"):
-        contract.submit_report("", DEFAULT_EVIDENCE_URL, "Bug details")
-
     with direct_vm.expect_revert("Target evidence URL cannot be empty"):
-        contract.submit_report("0xResearcher", "", "Bug details")
+        contract.submit_report("", "Bug details")
 
     with direct_vm.expect_revert("Vulnerability details cannot be empty"):
-        contract.submit_report("0xResearcher", DEFAULT_EVIDENCE_URL, "")
+        contract.submit_report(DEFAULT_EVIDENCE_URL, "")
 
 
 def test_administrative_methods_and_access_control(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -803,6 +947,13 @@ def test_administrative_methods_and_access_control(direct_vm, direct_deploy, dir
     assert status["payout_table"]["CRITICAL"] == 10000
     assert status["scope_policy_url"] == "https://security.example.io/new-policy.md"
     assert status["authoritative_target_prefix"] == "https://raw.githubusercontent.com/JimmyOgb/new-repo/"
+
+    # Insecure URL updates revert
+    with direct_vm.expect_revert("scheme must be https"):
+        contract.update_scope_policy("http://insecure.example.io/policy.md")
+
+    with direct_vm.expect_revert("scheme must be https"):
+        contract.update_authoritative_target_prefix("http://raw.githubusercontent.com/JimmyOgb/new-repo/")
 
     # Non-owner attempts admin actions -> reverts
     direct_vm.sender = direct_bob

@@ -1,6 +1,7 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 import json
+import urllib.parse
 from dataclasses import dataclass
 from genlayer import *
 
@@ -8,27 +9,105 @@ ALLOWED_SEVERITIES = {"NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
 SEVERITY_RANKS = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
 
+def validate_secure_url(url: str, param_name: str = "URL") -> urllib.parse.SplitResult:
+    """
+    Deconstructs and validates URL scheme, host/authority, path, query, and credentials.
+    Enforces scheme == 'https', non-empty host, rejects query strings, fragments, userinfo,
+    and path traversal elements ('..').
+    """
+    if not url or not isinstance(url, str) or not url.strip():
+        raise gl.vm.UserError(f"{param_name} cannot be empty")
+
+    clean_url = url.strip()
+    try:
+        parsed = urllib.parse.urlsplit(clean_url)
+    except Exception as exc:
+        raise gl.vm.UserError(f"{param_name} violates authoritative domain boundary: malformed URL ({exc})")
+
+    if parsed.scheme.lower() != "https":
+        raise gl.vm.UserError(f"{param_name} violates authoritative domain boundary: scheme must be https")
+
+    if not parsed.netloc or not parsed.hostname:
+        raise gl.vm.UserError(f"{param_name} violates authoritative domain boundary: missing host")
+
+    if "@" in parsed.netloc or parsed.username is not None or parsed.password is not None:
+        raise gl.vm.UserError(
+            f"{param_name} violates authoritative domain boundary: credentials or userinfo not permitted"
+        )
+
+    if parsed.query:
+        raise gl.vm.UserError(f"{param_name} violates authoritative domain boundary: query strings not permitted")
+
+    if parsed.fragment:
+        raise gl.vm.UserError(f"{param_name} violates authoritative domain boundary: fragments not permitted")
+
+    unquoted_path = urllib.parse.unquote(parsed.path)
+    segments = unquoted_path.split("/")
+    if any(seg == ".." for seg in segments):
+        raise gl.vm.UserError(
+            f"{param_name} violates authoritative domain boundary: path traversal elements not permitted"
+        )
+
+    return parsed
+
+
+def validate_url_against_boundary(url: str, prefix: str) -> None:
+    """
+    Enforces parsed origin and path-boundary validation:
+    1. Scheme must be https for both prefix and target URL.
+    2. Exact host match against authoritative domain (case-insensitive).
+    3. Exact port match if specified.
+    4. Path prefix boundary checking such that path segments strictly start with the allowed path root,
+       preventing lookalike names (e.g. bug-bounty-arbiter-fake).
+    """
+    prefix_parsed = validate_secure_url(prefix, "Authoritative target prefix")
+    url_parsed = validate_secure_url(url, "Evidence URL")
+
+    # Enforce exact host match against authoritative domain
+    if url_parsed.hostname.lower() != prefix_parsed.hostname.lower():
+        raise gl.vm.UserError("Evidence URL violates authoritative domain boundary: hostname mismatch")
+
+    # Enforce exact port match if defined
+    if url_parsed.port != prefix_parsed.port:
+        raise gl.vm.UserError("Evidence URL violates authoritative domain boundary: port mismatch")
+
+    # Enforce strict path prefix boundary by path segments
+    prefix_segments = [s for s in prefix_parsed.path.split("/") if s]
+    url_segments = [s for s in url_parsed.path.split("/") if s]
+
+    if len(url_segments) < len(prefix_segments):
+        raise gl.vm.UserError("Evidence URL violates authoritative domain boundary: path too short")
+
+    for p_seg, u_seg in zip(prefix_segments, url_segments):
+        if p_seg != u_seg:
+            raise gl.vm.UserError("Evidence URL violates authoritative domain boundary: path prefix mismatch")
+
+
 @allow_storage
 @dataclass
-class Report:
+class ReportMetadata:
     id: u256
-    researcher: str
+    researcher: Address
     target_evidence_url: str
     valid: bool
     severity: str
     rationale: str
-    payout_due: u256
-    claimed: bool
+    recommended_payout_units: u256
+
+
+Report = ReportMetadata
 
 
 class BugBountyArbiter(gl.Contract):
     """
     Autonomous Bug Bounty Triage & Severity Arbiter (BugBountyArbiter)
 
-    A decentralized smart contract primitive for GenLayer that automates vulnerability
-    report intake, live policy-grounded and target-evidence-grounded multi-validator AI triage,
-    fail-closed consensus, exact severity consensus, and on-chain payout settlement while
-    preserving strict state hygiene and authoritative domain boundaries.
+    A decentralized smart contract adjudication arbiter and oracle primitive for GenLayer.
+    Automates vulnerability report intake, authenticated submitter binding (msg.sender),
+    live policy-grounded and target-evidence-grounded multi-validator AI triage, fail-closed
+    consensus, exact severity consensus, and certified on-chain adjudication metadata generation
+    for downstream consumption by vaults, escrows, and DAOs while preserving strict state hygiene
+    and parsed origin/path-boundary validation.
     """
 
     project_owner: str
@@ -37,7 +116,7 @@ class BugBountyArbiter(gl.Contract):
     is_active: bool
     total_submissions: u256
     payout_table: TreeMap[str, u256]
-    reports: TreeMap[u256, Report]
+    reports: TreeMap[u256, ReportMetadata]
 
     def __init__(
         self,
@@ -52,13 +131,20 @@ class BugBountyArbiter(gl.Contract):
         if not authoritative_target_prefix or not str(authoritative_target_prefix).strip():
             raise gl.vm.UserError("Authoritative target prefix cannot be empty")
 
+        clean_policy_url = str(scope_policy_url).strip()
+        clean_target_prefix = str(authoritative_target_prefix).strip()
+
+        # Robust URL validation on scope policy and target prefix
+        validate_secure_url(clean_policy_url, "Scope policy URL")
+        validate_secure_url(clean_target_prefix, "Authoritative target prefix")
+
         self.project_owner = str(project_owner).strip()
-        self.scope_policy_url = str(scope_policy_url).strip()
-        self.authoritative_target_prefix = str(authoritative_target_prefix).strip()
+        self.scope_policy_url = clean_policy_url
+        self.authoritative_target_prefix = clean_target_prefix
         self.is_active = True
         self.total_submissions = u256(0)
 
-        # Standard bug bounty reward tiers (points / native tokens)
+        # Standard bug bounty recommendation tiers (adjudication metadata points / units)
         self.payout_table["NONE"] = u256(0)
         self.payout_table["LOW"] = u256(100)
         self.payout_table["MEDIUM"] = u256(500)
@@ -74,36 +160,38 @@ class BugBountyArbiter(gl.Contract):
     @gl.public.write
     def submit_report(
         self,
-        researcher: str,
         target_evidence_url: str,
         vulnerability_details: str,
     ) -> int:
         """
         Submit a security vulnerability report for multi-validator AI adjudication.
+        Binds the report directly to the authenticated transaction caller (gl.message.sender).
 
         Runs non-deterministic triage via gl.vm.run_nondet:
-        1. Enforces strict authoritative domain boundary on target_evidence_url.
+        1. Enforces parsed origin and path-boundary validation on target_evidence_url.
         2. Strict fail-closed live acquisition of both scope policy and target evidence.
         3. Multi-validator comparative Equivalence Principle enforcing exact agreement on
-           validity boolean and exact severity tier to deterministically bind payout_due.
+           validity boolean and exact severity tier to deterministically bind recommended_payout_units.
         """
         if not self.is_active:
             raise gl.vm.UserError("Bounty program is currently paused or inactive")
 
-        clean_researcher = str(researcher).strip() if researcher else ""
+        # Automatically bind report to authenticated transaction caller
+        try:
+            caller: Address = gl.message.sender  # type: ignore
+        except AttributeError:
+            caller = gl.message.sender_address
+
         clean_evidence_url = str(target_evidence_url).strip() if target_evidence_url else ""
         clean_details = str(vulnerability_details).strip() if vulnerability_details else ""
 
-        if not clean_researcher:
-            raise gl.vm.UserError("Researcher identity/address cannot be empty")
         if not clean_evidence_url:
             raise gl.vm.UserError("Target evidence URL cannot be empty")
         if not clean_details:
             raise gl.vm.UserError("Vulnerability details cannot be empty")
 
-        # Enforce Authority: Verify that target_evidence_url.startswith(self.authoritative_target_prefix)
-        if not clean_evidence_url.startswith(self.authoritative_target_prefix):
-            raise gl.vm.UserError("Evidence URL violates authoritative domain boundary")
+        # Enforce robust parsed origin and path-boundary validation
+        validate_url_against_boundary(clean_evidence_url, self.authoritative_target_prefix)
 
         policy_url = self.scope_policy_url
         prefix = self.authoritative_target_prefix
@@ -163,7 +251,7 @@ Evaluate the following vulnerability report submitted with authoritative target 
 {evidence_snippet}
 
 === RESEARCHER SUBMISSION DETAILS ===
-Researcher: {clean_researcher}
+Researcher Address: {caller}
 Target Evidence URL: {clean_evidence_url}
 Vulnerability Details & Steps to Reproduce:
 \"\"\"{clean_details}\"\"\"
@@ -248,8 +336,10 @@ Return strictly a JSON object conforming to:
                 return False
 
             # 5. Independent Authority Validation:
-            # Validators independently verify that the target evidence URL obeys the authoritative prefix
-            if not clean_evidence_url.startswith(prefix):
+            # Validators independently verify that the target evidence URL obeys the authoritative origin and path boundary
+            try:
+                validate_url_against_boundary(clean_evidence_url, prefix)
+            except Exception:
                 return False
 
             # 6. Validator independently runs leader_fn()
@@ -275,8 +365,7 @@ Return strictly a JSON object conforming to:
                 return False
 
             # 9. Strict Severity Equivalence (Exact Binding):
-            # Because severity tier directly indexes into self.payout_table (payout_due),
-            # validators MUST independently agree on the EXACT severity tier.
+            # Validators MUST independently agree on the EXACT severity tier.
             # Zero tolerance for adjacent tier drift or divergence.
             if leader_sev != val_sev:
                 return False
@@ -290,62 +379,46 @@ Return strictly a JSON object conforming to:
         rationale = str(adjudication["rationale"]).strip()
 
         if is_valid and severity in ALLOWED_SEVERITIES:
-            payout_due = self.payout_table[severity]
+            recommended_payout_units = self.payout_table[severity]
         else:
             severity = "NONE"
-            payout_due = u256(0)
+            recommended_payout_units = u256(0)
 
         new_report_id = int(self.total_submissions) + 1
         self.total_submissions = u256(new_report_id)
 
         # State hygiene: store only sanitized metadata, never raw exploit payloads
-        self.reports[u256(new_report_id)] = Report(
+        self.reports[u256(new_report_id)] = ReportMetadata(
             id=u256(new_report_id),
-            researcher=clean_researcher,
+            researcher=caller,
             target_evidence_url=clean_evidence_url,
             valid=is_valid,
             severity=severity,
             rationale=rationale,
-            payout_due=payout_due,
-            claimed=False,
+            recommended_payout_units=recommended_payout_units,
         )
 
         return new_report_id
 
-    @gl.public.write
-    def claim_payout(self, report_id: int) -> int:
+    @gl.public.view
+    def get_adjudicated_report(self, report_id: u256) -> ReportMetadata:
         """
-        Claim the bounty payout for an adjudicated valid report.
-        Strict gating prevents double claims or claiming on invalid/zero-payout reports.
+        View certified adjudication metadata for downstream consumption (vaults, escrows, DAOs).
         """
-        if report_id <= 0 or report_id > int(self.total_submissions):
+        if int(report_id) <= 0 or int(report_id) > int(self.total_submissions):
             raise gl.vm.UserError("Report does not exist")
 
-        report = self.reports[u256(report_id)]
-
-        if not report.valid:
-            raise gl.vm.UserError("Cannot claim payout on invalid or rejected report")
-
-        if report.claimed:
-            raise gl.vm.UserError("Payout has already been claimed for this report")
-
-        payout = int(report.payout_due)
-        if payout <= 0:
-            raise gl.vm.UserError("No payout due for this report")
-
-        report.claimed = True
-        self.reports[u256(report_id)] = report
-        return payout
+        return self.reports[u256(int(report_id))]
 
     @gl.public.view
-    def get_report(self, report_id: int) -> dict:
+    def get_report(self, report_id: u256) -> dict:
         """
-        View sanitized on-chain metadata for a submitted report.
+        View serialized on-chain adjudication metadata for a submitted report.
         """
-        if report_id <= 0 or report_id > int(self.total_submissions):
+        if int(report_id) <= 0 or int(report_id) > int(self.total_submissions):
             raise gl.vm.UserError("Report does not exist")
 
-        r = self.reports[u256(report_id)]
+        r = self.reports[u256(int(report_id))]
         return {
             "id": int(r.id),
             "researcher": str(r.researcher),
@@ -353,14 +426,14 @@ Return strictly a JSON object conforming to:
             "valid": bool(r.valid),
             "severity": str(r.severity),
             "rationale": str(r.rationale),
-            "payout_due": int(r.payout_due),
-            "claimed": bool(r.claimed),
+            "recommended_payout_units": int(r.recommended_payout_units),
+            "payout_due": int(r.recommended_payout_units),
         }
 
     @gl.public.view
     def get_program_status(self) -> dict:
         """
-        View bounty program status, configuration, and current payout table.
+        View bounty program status, configuration, and current recommendation table.
         """
         return {
             "project_owner": str(self.project_owner),
@@ -385,7 +458,7 @@ Return strictly a JSON object conforming to:
 
     @gl.public.write
     def update_payout(self, severity: str, amount: int) -> None:
-        """Administrative method to update payout table values."""
+        """Administrative method to update payout recommendation table values."""
         self._require_owner()
         sev = str(severity).strip().upper()
         if sev not in ALLOWED_SEVERITIES:
@@ -401,6 +474,7 @@ Return strictly a JSON object conforming to:
         clean_url = str(new_scope_url).strip() if new_scope_url else ""
         if not clean_url:
             raise gl.vm.UserError("Scope policy URL cannot be empty")
+        validate_secure_url(clean_url, "Scope policy URL")
         self.scope_policy_url = clean_url
 
     @gl.public.write
@@ -410,4 +484,5 @@ Return strictly a JSON object conforming to:
         clean_prefix = str(new_prefix).strip() if new_prefix else ""
         if not clean_prefix:
             raise gl.vm.UserError("Authoritative target prefix cannot be empty")
+        validate_secure_url(clean_prefix, "Authoritative target prefix")
         self.authoritative_target_prefix = clean_prefix
